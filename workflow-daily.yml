@@ -1,0 +1,63 @@
+# === MOVE THIS FILE ===
+# This file should be at: .github/workflows/daily.yml
+#
+# Run this command to place it correctly:
+#   mkdir -p .github/workflows && mv workflow-daily.yml .github/workflows/daily.yml
+#
+# See README.md for full setup instructions.
+# ======================
+
+name: Daily Ghost Digest
+
+on:
+  schedule:
+    # 09:00 UTC — adjust to your preferred time
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ghost-digest
+  cancel-in-progress: false
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install ghst CLI
+        run: npm install -g @tryghost/ghst
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Run digest
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GHST_SITES: ${{ secrets.GHST_SITES }}
+        run: python scripts/ghost_digest.py
+
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state/
+          if ! git diff --cached --quiet; then
+            git commit -m "state: daily snapshot $(date -u +%Y-%m-%d)"
+            git push
+          else
+            echo "No state changes to commit"
+          fi
