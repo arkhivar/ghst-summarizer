@@ -1,0 +1,32 @@
+# Ghost sites to monitor.
+# Each site needs: alias, url, token, and at least one Telegram destination.
+#
+# Tokens are Ghost Staff Access Tokens in the format "{id}:{secret}".
+# You can also pass tokens via the GHST_SITES env var (JSON array) which
+# overrides these values — useful for keeping secrets out of this file.
+#
+# For Telegram destinations, use EITHER:
+#   - Legacy: chat_id + thread_id (for groups with topics)
+#   - New: destinations array (supports multiple destinations per site)
+
+sites:
+  # Example — copy and adapt for each of your Ghost sites:
+  #
+  # my-blog:
+  #   alias: my-blog
+  #   url: https://myblog.example.com
+  #   token: "{staff_token_id}:{secret}"   # Or omit and use GHST_SITES env
+  #   chat_id: -1001234567890
+  #   thread_id: 42
+  #
+  # With multiple destinations:
+  #
+  # another-blog:
+  #   alias: another-blog
+  #   url: https://blog2.example.com
+  #   token: "{staff_token_id}:{secret}"
+  #   destinations:
+  #     - chat_id: -1001234567890
+  #       thread_id: 12
+  #     - chat_id: -1009876543210
+  #       channel: true
