@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-Daily Ghost digest — cron path.
+Daily Ghost digest -- cron path (posts + pages edition).
 
-Reads config.yml for Ghost sites, fetches all published posts as plaintext
-AND html via the `ghst` CLI, compares plaintext against state/<site>/posts.json
-(yesterday's snapshot), computes diffs for changed posts, asks DeepSeek V4-Flash
-for a daily summary, and posts to the configured Telegram destination(s).
+Reads config.yml for Ghost sites, fetches all published posts AND pages as
+plaintext AND html via the `ghst` CLI, compares plaintext against
+state/<site>/{posts,pages}.json (yesterday's snapshot), computes diffs for
+changed content, asks DeepSeek V4-Flash for a daily summary, and posts to the
+configured Telegram destination(s).
 
-Additionally: converts posts to Markdown and writes them to MIRROR_DIR for
-human-readable diff viewing in a separate Git repository.
+Additionally: converts posts and pages to Markdown and writes them to
+MIRROR_DIR/<site>/{posts,pages}/ for human-readable diff viewing in a
+separate Git repository.
 
 State bootstrap: first run for a site silently saves the snapshot and does
 NOT notify (avoids a burst of stale notifications on initial setup).
@@ -22,7 +24,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -30,7 +32,7 @@ import yaml
 
 # Optional: markdownify for HTML->Markdown conversion
 try:
-    from markdownify import markdownify as md
+    from markdownify import markdownify as md_converter
     HAS_MARKDOWNIFY = True
 except ImportError:
     HAS_MARKDOWNIFY = False
@@ -49,13 +51,12 @@ TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 MIN_DIFF_CHARS = 10
 # Max diff length per site (truncate to avoid huge prompts)
 MAX_DIFF_PER_SITE = 8000
-# Max posts to include in a single digest (safety cap)
-MAX_CHANGED_POSTS = 20
+# Max items to include in a single digest (safety cap)
+MAX_CHANGED_ITEMS = 20
 
 
 # ---------- helpers ----------
 def resolve_destinations(project: dict) -> list[tuple[int, int | None]]:
-    """Return list of (chat_id, thread_id_or_None) tuples."""
     out: list[tuple[int, int | None]] = []
 
     def _add(chat_id, thread_id, is_channel=False):
@@ -80,36 +81,33 @@ def resolve_destinations(project: dict) -> list[tuple[int, int | None]]:
     return out
 
 
-def load_state(site_alias: str) -> dict[str, dict]:
-    """Return {slug: post_dict} from yesterday's snapshot, or {} if first run."""
-    path = STATE_DIR / site_alias / "posts.json"
+def load_state(site_alias: str, content_type: str) -> dict[str, dict]:
+    path = STATE_DIR / site_alias / f"{content_type}.json"
     if not path.exists():
         return {}
     try:
-        posts = json.loads(path.read_text())
-        return {p["slug"]: p for p in posts if p.get("slug")}
+        data = json.loads(path.read_text())
+        return {p["slug"]: p for p in data if p.get("slug")}
     except (json.JSONDecodeError, KeyError, TypeError):
-        print(f"[warn] {site_alias}/posts.json corrupt -- starting fresh", file=sys.stderr)
+        print(f"[warn] {site_alias}/{content_type}.json corrupt -- starting fresh", file=sys.stderr)
         return {}
 
 
-def save_state(site_alias: str, posts: list[dict]) -> None:
+def save_state(site_alias: str, content_type: str, items: list[dict]) -> None:
     dir_path = STATE_DIR / site_alias
     dir_path.mkdir(parents=True, exist_ok=True)
-    (dir_path / "posts.json").write_text(
-        json.dumps(posts, indent=2, ensure_ascii=False) + "\n"
+    (dir_path / f"{content_type}.json").write_text(
+        json.dumps(items, indent=2, ensure_ascii=False) + "\n"
     )
 
 
 def _parse_iso_date(date_str: str | None) -> str:
-    """Extract YYYY-MM-DD from an ISO date string."""
     if not date_str:
-        return datetime.utcnow().strftime("%Y-%m-%d")
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return date_str[:10]
 
 
 def _normalize_author(author: dict | str | None) -> str:
-    """Extract author name from various Ghost API shapes."""
     if isinstance(author, dict):
         return author.get("name") or author.get("slug", "unknown")
     if author:
@@ -118,12 +116,10 @@ def _normalize_author(author: dict | str | None) -> str:
 
 
 def _html_to_markdown(html: str) -> str:
-    """Convert Ghost HTML to clean Markdown."""
     if not HAS_MARKDOWNIFY or not html:
         return ""
     try:
-        md_text = md(html, heading_style="ATX", strip=["script", "style"])
-        # Collapse excessive blank lines
+        md_text = md_converter(html, heading_style="ATX", strip=["script", "style"])
         md_text = re.sub(r"\n{3,}", "\n\n", md_text)
         return md_text.strip()
     except Exception as e:
@@ -131,80 +127,83 @@ def _html_to_markdown(html: str) -> str:
         return ""
 
 
-def fetch_posts(site: dict) -> list[dict]:
-    """Use ghst CLI to fetch all published posts with html + plaintext."""
+def _authenticate_ghst(url: str, token: str) -> bool:
+    result = subprocess.run(
+        ["ghst", "auth", "login", "--non-interactive", "--url", url, "--staff-token", token, "--json"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        print(f"[error] ghst auth failed: {result.stderr}", file=sys.stderr)
+        return False
+    return True
+
+
+def _fetch_content_type(site: dict, content_type: str) -> list[dict]:
+    """Fetch all published items of a given type ('post' or 'page') via ghst CLI."""
     alias = site["alias"]
     url = site["url"]
     token = site["token"]
 
-    # Authenticate ghst non-interactively
-    auth_result = subprocess.run(
-        ["ghst", "auth", "login", "--non-interactive",
-         "--url", url, "--staff-token", token, "--json"],
-        capture_output=True, text=True, timeout=60,
-    )
-    if auth_result.returncode != 0:
-        print(f"[error] ghst auth failed for {alias}: {auth_result.stderr}",
-              file=sys.stderr)
+    if not _authenticate_ghst(url, token):
         return []
 
-    # Fetch published posts with both html and plaintext in one call
-    result = subprocess.run(
-        ["ghst", "post", "list", "--limit", "all",
-         "--filter", "status:published",
-         "--formats", "html,plaintext",
-         "--json",
-         "--jq", (".posts[] | {slug, title, html, plaintext, updated_at, "
-                  "published_at, url, primary_author, feature_image, excerpt}")],
-        capture_output=True, text=True, timeout=120,
-    )
+    cmd = [
+        "ghst", content_type, "list", "--limit", "all",
+        "--filter", "status:published",
+        "--formats", "html,plaintext",
+        "--json",
+        "--jq", (
+            f".{content_type}s[] | {{slug, title, html, plaintext, updated_at, "
+            f"published_at, url, primary_author, feature_image, excerpt}}"
+        ),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if result.returncode != 0:
-        print(f"[error] ghst post list failed for {alias}: {result.stderr}",
-              file=sys.stderr)
+        print(f"[error] ghst {content_type} list failed for {alias}: {result.stderr}", file=sys.stderr)
         return []
 
-    posts = []
+    items = []
     for line in result.stdout.strip().split("\n"):
         line = line.strip()
         if not line:
             continue
         try:
-            post = json.loads(line)
-            post["primary_author"] = _normalize_author(post.get("primary_author"))
-            posts.append(post)
+            item = json.loads(line)
+            item["primary_author"] = _normalize_author(item.get("primary_author"))
+            item["_type"] = content_type
+            items.append(item)
         except json.JSONDecodeError:
             continue
 
-    return posts
+    return items
 
 
 def is_trivial_diff(diff_text: str) -> bool:
-    """Return True if the diff is just whitespace changes."""
     stripped = diff_text.strip()
     if len(stripped) < MIN_DIFF_CHARS:
         return True
     return len("".join(stripped.split())) < 5
 
 
-def diff_posts(old_posts: dict[str, dict], new_posts: list[dict]) -> list[dict]:
-    """Return list of changed posts with their diffs."""
-    new_by_slug = {p["slug"]: p for p in new_posts if p.get("slug")}
+def diff_items(old_items: dict[str, dict], new_items: list[dict], content_type: str) -> list[dict]:
+    new_by_slug = {p["slug"]: p for p in new_items if p.get("slug")}
     changes: list[dict] = []
 
-    for slug, post in new_by_slug.items():
-        if slug not in old_posts:
+    for slug, item in new_by_slug.items():
+        if slug not in old_items:
             changes.append({
                 "slug": slug,
-                "title": post.get("title", slug),
-                "author": post.get("primary_author", "unknown"),
+                "title": item.get("title", slug),
+                "author": item.get("primary_author", "unknown"),
                 "change_type": "new",
-                "diff": f"[NEW POST]\n{post.get('plaintext', '')[:2000]}",
-                "url": post.get("url", ""),
+                "content_type": content_type,
+                "diff": f"[NEW {content_type.upper()}]\n{item.get('plaintext', '')[:2000]}",
+                "url": item.get("url", ""),
             })
             continue
 
-        old_text = old_posts[slug].get("plaintext") or ""
-        new_text = post.get("plaintext") or ""
+        old_text = old_items[slug].get("plaintext") or ""
+        new_text = item.get("plaintext") or ""
 
         if old_text == new_text:
             continue
@@ -222,108 +221,136 @@ def diff_posts(old_posts: dict[str, dict], new_posts: list[dict]) -> list[dict]:
 
         changes.append({
             "slug": slug,
-            "title": post.get("title", slug),
-            "author": post.get("primary_author", "unknown"),
+            "title": item.get("title", slug),
+            "author": item.get("primary_author", "unknown"),
             "change_type": "updated",
+            "content_type": content_type,
             "diff": diff,
-            "url": post.get("url", ""),
+            "url": item.get("url", ""),
         })
 
-    for slug, old_post in old_posts.items():
+    for slug, old_item in old_items.items():
         if slug not in new_by_slug:
             changes.append({
                 "slug": slug,
-                "title": old_post.get("title", slug),
-                "author": old_post.get("primary_author", "unknown"),
+                "title": old_item.get("title", slug),
+                "author": old_item.get("primary_author", "unknown"),
                 "change_type": "deleted",
-                "diff": "[POST REMOVED OR UNPUBLISHED]",
-                "url": old_post.get("url", ""),
+                "content_type": content_type,
+                "diff": f"[{content_type.upper()} REMOVED OR UNPUBLISHED]",
+                "url": old_item.get("url", ""),
             })
 
-    return changes[:MAX_CHANGED_POSTS]
+    return changes[:MAX_CHANGED_ITEMS]
 
 
 # ---------- Markdown mirroring ----------
-def mirror_posts(site_alias: str, posts: list[dict]) -> int:
-    """Write posts as Markdown files to MIRROR_DIR for diff viewing.
-
-    Returns number of files written.
-    """
-    site_mirror_dir = MIRROR_DIR / site_alias
+def _mirror_item(site_alias: str, content_type: str, item: dict) -> Path | None:
+    site_mirror_dir = MIRROR_DIR / site_alias / content_type
     site_mirror_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build set of expected filenames to detect stale files
+    slug = item.get("slug")
+    if not slug:
+        return None
+
+    if content_type == "post":
+        date_prefix = _parse_iso_date(item.get("published_at"))
+        filename = f"{date_prefix}-{slug}.md"
+    else:
+        filename = f"{slug}.md"
+
+    md_body = _html_to_markdown(item.get("html", ""))
+
+    frontmatter = ["---"]
+    frontmatter.append(f'title: "{item.get("title", slug)}"')
+    frontmatter.append(f"slug: {slug}")
+    frontmatter.append(f"type: {content_type}")
+    frontmatter.append(f'published_at: "{item.get("published_at", "")}"')
+    frontmatter.append(f'updated_at: "{item.get("updated_at", "")}"')
+    frontmatter.append(f'author: "{item.get("primary_author", "unknown")}"')
+    if item.get("url"):
+        frontmatter.append(f'url: "{item["url"]}"')
+    if item.get("feature_image"):
+        frontmatter.append(f'feature_image: "{item["feature_image"]}"')
+    if item.get("excerpt"):
+        frontmatter.append(f'excerpt: "{item["excerpt"]}"')
+    frontmatter.append("---")
+    frontmatter.append("")
+
+    content = "\n".join(frontmatter) + md_body + "\n"
+    filepath = site_mirror_dir / filename
+    filepath.write_text(content, encoding="utf-8")
+    return filepath
+
+
+def mirror_content(site_alias: str, content_type: str, items: list[dict]) -> int:
+    site_mirror_dir = MIRROR_DIR / site_alias / content_type
+    site_mirror_dir.mkdir(parents=True, exist_ok=True)
+
     expected_files: set[str] = set()
     written = 0
 
-    for post in posts:
-        slug = post.get("slug")
-        if not slug:
-            continue
+    for item in items:
+        fp = _mirror_item(site_alias, content_type, item)
+        if fp:
+            expected_files.add(fp.name)
+            written += 1
 
-        date_prefix = _parse_iso_date(post.get("published_at"))
-        filename = f"{date_prefix}-{slug}.md"
-        expected_files.add(filename)
-
-        md_body = _html_to_markdown(post.get("html", ""))
-        frontmatter_lines = [
-            "---",
-            f'title: "{post.get("title", slug)}"',
-            f"slug: {slug}",
-            f'published_at: "{post.get("published_at", "")}"',
-            f'updated_at: "{post.get("updated_at", "")}"',
-            f'author: "{post.get("primary_author", "unknown")}"',
-        ]
-        if post.get("url"):
-            frontmatter_lines.append(f'url: "{post["url"]}"')
-        if post.get("feature_image"):
-            frontmatter_lines.append(f'feature_image: "{post["feature_image"]}"')
-        frontmatter_lines.append("---")
-        frontmatter_lines.append("")
-
-        content = "\n".join(frontmatter_lines) + md_body + "\n"
-        filepath = site_mirror_dir / filename
-        filepath.write_text(content, encoding="utf-8")
-        written += 1
-
-    # Remove stale files (posts that were deleted or had slug changes)
     if site_mirror_dir.exists():
         for existing in site_mirror_dir.glob("*.md"):
             if existing.name not in expected_files:
                 existing.unlink()
-                print(f"  [mirror] removed stale file {site_alias}/{existing.name}")
+                print(f"  [mirror] removed stale {site_alias}/{content_type}/{existing.name}")
 
-    print(f"  [mirror] {written} Markdown file(s) in {site_mirror_dir}")
+    print(f"  [mirror] {written} {content_type}(s) in {site_mirror_dir}")
     return written
 
 
 # ---------- LLM ----------
 def build_site_prompt(alias: str, url: str, changes: list[dict]) -> str:
-    """Build a single prompt for all changes on one site."""
     parts = [f"Site: {alias} ({url})", ""]
-    parts.append(f"{len(changes)} post(s) changed since yesterday:")
+
+    posts = [c for c in changes if c["content_type"] == "post"]
+    pages = [c for c in changes if c["content_type"] == "page"]
+
+    parts.append(f"Total: {len(posts)} post(s), {len(pages)} page(s) changed since yesterday:")
 
     total_diff = 0
-    for ch in changes:
+
+    def _add_change(ch: dict) -> bool:
+        nonlocal total_diff
         diff_text = ch["diff"]
         remaining = MAX_DIFF_PER_SITE - total_diff
         if remaining <= 0:
             parts.append("\n... [additional changes omitted] ...")
-            break
+            return False
         if len(diff_text) > remaining:
             diff_text = diff_text[:remaining] + "\n... [truncated] ..."
 
-        parts.append(f"\n--- {ch['title']} ({ch['change_type']}) ---")
+        parts.append(f"\n--- {ch['title']} ({ch['content_type']} {ch['change_type']}) ---")
         parts.append(f"Author: {ch['author']}")
         parts.append(diff_text)
         total_diff += len(diff_text)
+        return True
+
+    if posts:
+        parts.append("\n== Posts ==")
+        for ch in posts:
+            if not _add_change(ch):
+                break
+
+    if pages:
+        parts.append("\n== Pages ==")
+        for ch in pages:
+            if not _add_change(ch):
+                break
 
     return "\n".join(parts)
 
 
 def call_deepseek(prompt: str, api_key: str) -> str:
     system_msg = (
-        "You write terse daily digests of blog post changes for a site owner. "
+        "You write terse daily digests of blog post and page changes for a site owner. "
         "Rules: 2-4 short sentences total for the entire digest, no emoji, no headers, "
         "no bullet lists, no marketing tone. Focus on WHAT changed and WHY it matters. "
         "Mention the author name(s) briefly. If a change is trivial, say so briefly. "
@@ -331,8 +358,7 @@ def call_deepseek(prompt: str, api_key: str) -> str:
     )
     r = requests.post(
         DEEPSEEK_URL,
-        headers={"Authorization": f"Bearer {api_key}",
-                 "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
             "model": DEEPSEEK_MODEL,
             "messages": [
@@ -349,8 +375,7 @@ def call_deepseek(prompt: str, api_key: str) -> str:
         print(f"[error] DeepSeek {r.status_code}: {r.text[:500]}", file=sys.stderr)
         return "(summary unavailable -- LLM error)"
     data = r.json()
-    return (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip() \
-        or "(empty summary)"
+    return (data.get("choices") or [{}])[0].get("message", {}).get("content", "").strip() or "(empty summary)"
 
 
 # ---------- Telegram ----------
@@ -362,8 +387,7 @@ def tg_escape(s: str) -> str:
     return s
 
 
-def send_telegram(token: str, chat_id: int, thread_id: int | None,
-                  text: str) -> None:
+def send_telegram(token: str, chat_id: int, thread_id: int | None, text: str) -> None:
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -385,52 +409,56 @@ def send_telegram(token: str, chat_id: int, thread_id: int | None,
 
 # ---------- main ----------
 def process_site(site: dict, tokens: dict) -> bool:
-    """Fetch, diff, summarize, notify, mirror for one site.
-
-    Return True if content changes were found and notified.
-    """
     alias = site["alias"]
     url = site.get("url", alias)
 
     print(f"\n[site] {alias}")
 
-    old_posts = load_state(alias)
-    print(f"  [state] {len(old_posts)} post(s) in previous snapshot")
+    old_posts = load_state(alias, "posts")
+    old_pages = load_state(alias, "pages")
+    print(f"  [state] {len(old_posts)} post(s), {len(old_pages)} page(s) in previous snapshot")
 
-    new_posts = fetch_posts(site)
-    if not new_posts:
-        print(f"  [skip] no posts fetched for {alias}")
+    new_posts = _fetch_content_type(site, "post")
+    new_pages = _fetch_content_type(site, "page")
+
+    if not new_posts and not new_pages:
+        print(f"  [skip] nothing fetched for {alias}")
         return False
-    print(f"  [fetch] {len(new_posts)} published post(s)")
 
-    # Always mirror current posts to Markdown (independent of notification)
-    mirror_posts(alias, new_posts)
+    print(f"  [fetch] {len(new_posts)} post(s), {len(new_pages)} page(s)")
 
-    if not old_posts:
-        # Bootstrap: save silently, no notification
-        save_state(alias, new_posts)
+    mirror_content(alias, "posts", new_posts)
+    mirror_content(alias, "pages", new_pages)
+
+    if not old_posts and not old_pages:
+        save_state(alias, "posts", new_posts)
+        save_state(alias, "pages", new_pages)
         print(f"  [bootstrap] snapshot saved, no notification")
         return False
 
-    changes = diff_posts(old_posts, new_posts)
+    post_changes = diff_items(old_posts, new_posts, "post")
+    page_changes = diff_items(old_pages, new_pages, "page")
+    changes = post_changes + page_changes
+
     if not changes:
         print(f"  [info] no content changes")
-        save_state(alias, new_posts)
+        save_state(alias, "posts", new_posts)
+        save_state(alias, "pages", new_pages)
         return False
 
-    print(f"  [changes] {len(changes)} post(s) with content changes")
+    print(f"  [changes] {len(post_changes)} post(s), {len(page_changes)} page(s) with content changes")
 
     prompt = build_site_prompt(alias, url, changes)
     summary = call_deepseek(prompt, tokens["ds"])
     print(f"  [llm] {summary[:200]}")
 
-    date_str = datetime.utcnow().strftime("%Y-%m-%d")
-    header = f"*{tg_escape(alias)}* · {date_str}"
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    header = f"*{tg_escape(alias)}* \u00b7 {date_str}"
     body = tg_escape(summary)
     links = ""
     for ch in changes:
         if ch.get("url"):
-            links += f"\n\[{tg_escape(ch['title'][:40])}\]({ch['url']})"
+            links += f"\n[{tg_escape(ch['title'][:40])}]({ch['url']})"
 
     msg = f"{header}\n\n{body}" + (links if links else "")
 
@@ -438,8 +466,8 @@ def process_site(site: dict, tokens: dict) -> bool:
     for chat_id, thread_id in destinations:
         send_telegram(tokens["tg"], chat_id, thread_id, msg)
 
-    # Save new snapshot for tomorrow
-    save_state(alias, new_posts)
+    save_state(alias, "posts", new_posts)
+    save_state(alias, "pages", new_pages)
     return True
 
 
@@ -448,8 +476,7 @@ def main() -> int:
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
     if not ds_key or not tg_token:
-        print("[fatal] DEEPSEEK_API_KEY and TELEGRAM_BOT_TOKEN required",
-              file=sys.stderr)
+        print("[fatal] DEEPSEEK_API_KEY and TELEGRAM_BOT_TOKEN required", file=sys.stderr)
         return 1
 
     if not CONFIG_PATH.exists():
@@ -464,7 +491,6 @@ def main() -> int:
         print("[info] no sites configured in config.yml")
         return 0
 
-    # Sites can also come from GHST_SITES env (JSON array)
     env_sites = os.environ.get("GHST_SITES", "")
     if env_sites:
         try:
@@ -478,13 +504,11 @@ def main() -> int:
                     else:
                         sites.append(es)
         except json.JSONDecodeError:
-            print("[warn] GHST_SITES env is not valid JSON, ignoring",
-                  file=sys.stderr)
+            print("[warn] GHST_SITES env is not valid JSON, ignoring", file=sys.stderr)
 
     if not HAS_MARKDOWNIFY and MIRROR_DIR != REPO_ROOT / "mirror":
         print("[warn] markdownify not installed but MIRROR_DIR is set; "
-              "mirroring will be skipped. pip install markdownify",
-              file=sys.stderr)
+              "mirroring will be skipped. pip install markdownify", file=sys.stderr)
 
     tokens = {"ds": ds_key, "tg": tg_token}
     total_changed = 0
@@ -499,8 +523,7 @@ def main() -> int:
             if changed:
                 total_changed += 1
         except Exception as e:
-            print(f"[error] {site.get('alias', '?')}: {type(e).__name__}: {e}",
-                  file=sys.stderr)
+            print(f"[error] {site.get('alias', '?')}: {type(e).__name__}: {e}", file=sys.stderr)
 
     print(f"\n[done] {total_changed} site(s) with changes notified")
     return 0
